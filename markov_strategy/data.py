@@ -15,6 +15,8 @@ Responsible for:
 from __future__ import annotations
 
 import re
+from io import StringIO
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -58,7 +60,7 @@ def get_sp500_tickers() -> list[str]:
         pass  # fall through to HTML fallback
 
     html = _get_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-    tbl = pd.read_html(html, match="Symbol")[0]
+    tbl = pd.read_html(StringIO(html), match="Symbol")[0]
     return (
         tbl["Symbol"]
         .astype(str)
@@ -71,7 +73,7 @@ def get_sp500_tickers() -> list[str]:
 def get_hangseng_tickers() -> list[str]:
     """Hang Seng Index constituents, scraped from Wikipedia."""
     html = _get_html("https://en.wikipedia.org/wiki/Hang_Seng_Index")
-    tables = pd.read_html(html)
+    tables = pd.read_html(StringIO(html))
     headers = {"ticker", "stock code", "stock code(s)", "code"}
 
     for table in tables:
@@ -95,7 +97,7 @@ def get_hangseng_tickers() -> list[str]:
 def get_ftse_tickers() -> list[str]:
     """FTSE 100 constituents, scraped from Wikipedia."""
     html = _get_html("https://en.wikipedia.org/wiki/FTSE_100_Index")
-    tables = pd.read_html(html)
+    tables = pd.read_html(StringIO(html))
 
     for table in tables:
         for cand in ("EPIC", "Ticker", "Ticker symbol"):

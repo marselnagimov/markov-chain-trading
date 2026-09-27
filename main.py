@@ -39,6 +39,10 @@ def parse_args():
     p.add_argument("--save-plot", type=str, default=None,
                    help="path to save the equity-curve plot instead of showing it")
     p.add_argument("--quiet", action="store_true", help="suppress per-ticker progress output")
+    p.add_argument("--tickers", type=str, default=None,
+                   help="comma-separated ticker list to use INSTEAD of scraping index "
+                        "universes (e.g. --tickers SPY,QQQ,AAPL,TSLA) — much faster for "
+                        "a first end-to-end smoke test")
     return p.parse_args()
 
 
@@ -47,14 +51,18 @@ def main():
     cfg = DEFAULT_CONFIG
     verbose = not args.quiet
 
-    print("Retrieving tickers...\n")
-    ticker_universe = build_ticker_universe(include_global=not args.no_global)
-    all_tickers = flatten_universe(ticker_universe)
-    if verbose:
-        for t in all_tickers:
-            print(t)
+    if args.tickers:
+        volatile_tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
+        print(f"Using manual ticker list ({len(volatile_tickers)}): {volatile_tickers}\n")
+    else:
+        print("Retrieving tickers...\n")
+        ticker_universe = build_ticker_universe(include_global=not args.no_global)
+        all_tickers = flatten_universe(ticker_universe)
+        if verbose:
+            for t in all_tickers:
+                print(t)
 
-    volatile_tickers = filter_by_volatility(all_tickers, top_frac=args.top_frac, verbose=verbose)
+        volatile_tickers = filter_by_volatility(all_tickers, top_frac=args.top_frac, verbose=verbose)
 
     # ---------- Signals with edge filter ----------
     all_signals = []
