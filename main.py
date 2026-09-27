@@ -66,22 +66,46 @@ def main():
 
     # ---------- Signals with edge filter ----------
     all_signals = []
+    n_no_data, n_no_edge, n_signals_from = 0, 0, 0
     for ticker in volatile_tickers:
         tm, train_df, test_df = build_markov_matrix(
             ticker, alpha=cfg.alpha_smooth
         )
         if tm is None or train_df is None or test_df is None:
+            n_no_data += 1
+            if verbose:
+                print(f"  {ticker}: no usable price data (download failed or too short history)")
             continue
         if not has_edge(train_df, tm, min_diff=cfg.threshold_diff, min_hit=cfg.min_hit_rate):
+            n_no_edge += 1
+            if verbose:
+                print(f"  {ticker}: no edge on train set (below hit-rate/sample-size threshold)")
             continue
         sigs = analyze_trade_signals(
             ticker, test_df, tm,
             min_diff=cfg.threshold_diff, hold_days=cfg.hold_days, kelly_cap=cfg.kelly_cap,
         )
+        if sigs:
+            n_signals_from += 1
+            if verbose:
+                print(f"  {ticker}: edge found, {len(sigs)} test-set signals generated")
         all_signals.extend(sigs)
 
+    print(f"\nSummary: {len(volatile_tickers)} tickers scanned | "
+          f"{n_no_data} had no usable data | {n_no_edge} had no edge | "
+          f"{n_signals_from} produced signals\n")
+
     if not all_signals:
-        print("No signals generated. Exiting.")
+        if n_no_data == len(volatile_tickers):
+            print("No signals generated because NO ticker returned usable price data.\n"
+                  "This almost always means the Yahoo Finance download itself is failing "
+                  "(rate limiting, missing curl_cffi, or a network/proxy issue) rather than "
+                  "the strategy having no edge. Try:\n"
+                  "  pip install --upgrade 'curl_cffi>=0.15' 'yfinance>=0.2.40'\n"
+                  "and re-run with a single ticker to isolate it, e.g.:\n"
+                  "  python main.py --tickers SPY")
+        else:
+            print("No signals generated. Exiting.")
         sys.exit(0)
 
     signal_df = pd.DataFrame(all_signals, columns=["Date", "Ticker", "Position", "EntryPrice", "ExitPrice", "Kelly"])

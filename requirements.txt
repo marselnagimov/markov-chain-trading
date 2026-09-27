@@ -1,10 +1,10 @@
 numpy>=1.24
 pandas>=2.0
 yfinance>=0.2.40
+curl_cffi>=0.15
 statsmodels>=0.14
 matplotlib>=3.7
 requests>=2.31
 beautifulsoup4>=4.12
 lxml>=4.9
 pytest>=7.4
-curl_cffi>=0.15
