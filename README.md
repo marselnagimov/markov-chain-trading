@@ -1,79 +1,127 @@
-# Markov Chain Multi-Market Trading Strategy
+# Markov-Chain Multi-Market Trading Strategy
 
-A backtested quantitative trading strategy that uses **Markov chain state transitions** on daily returns to generate long/short signals across global equity markets, with Kelly-criterion sizing, intraday stop losses, and an index-rotation fallback for quiet days.
+A research backtester for a discrete-state Markov-chain trading strategy,
+applied across the S&P 500, Hang Seng, Shanghai Composite, FTSE 100, Nikkei
+225, and a global macro basket (crypto, commodities, leveraged/ETF sector
+proxies). The strategy classifies each day's return into one of five
+z-scored states (`Very Down`, `Down`, `Neutral`, `Up`, `Very Up`), fits a
+train-only transition matrix per ticker, filters for tickers with a
+statistically meaningful directional edge, and sizes trades with a
+Kelly-capped position weight, fixed holding period, intraday stop losses,
+and a quiet-day index-rotation fallback.
 
-The backtest benchmarks performance against SPY (total return) and reports CAPM alpha, beta, Sharpe ratio, and CAGR.
+A full write-up of the methodology, assumptions, and known limitations is
+in [`paper/summary.pdf`](paper/summary.pdf) (built from [`paper/summary.tex`](paper/summary.tex)).
 
----
+## How it works
 
-## Strategy Overview
+1. **Universe construction** (`markov_strategy/data.py`) — scrapes/queries
+   current constituents of five major indices plus a fixed global macro
+   basket.
+2. **Volatility prefilter** (`markov_strategy/universe.py`) — keeps only the
+   top 20% most volatile tickers (configurable), since low-vol names rarely
+   clear the edge threshold and this keeps runtime manageable.
+3. **Markov modeling** (`markov_strategy/markov.py`) — for each ticker,
+   splits 20 years of daily returns 70/30 into train/test, z-scores using
+   **train-only** mean/std (no look-ahead), buckets into 5 states, and fits
+   a Laplace-smoothed transition matrix on the train split.
+4. **Edge filter** — a ticker is only traded if, on the train set, its
+   one-step-ahead directional signal (`P(up) - P(down)` beyond a threshold)
+   beats a minimum hit rate over a minimum sample size.
+5. **Signal generation** — on the **test** set, transition-matrix edges are
+   converted into sized Long/Short signals with a fixed holding period.
+6. **Backtest engine** (`markov_strategy/backtest.py`) — a daily event loop
+   that opens signal trades (or falls back to trend/vol-ranked index
+   rotation on days with no signal), applies intraday stop losses, marks
+   positions to market, and closes positions at the end of their holding
+   period, net of round-trip transaction costs.
+7. **Performance reporting** (`markov_strategy/metrics.py`) — Sharpe ratio,
+   CAGR, and CAPM alpha/beta vs. SPY, plus an equity-curve plot.
 
-1. **Universe construction.** Pulls constituents from the S&P 500, Hang Seng, Shanghai, FTSE 100, Nikkei 225, plus a curated set of global ETFs, FX, crypto, and futures.
-2. **Volatility prefilter.** Computes 20-year annualized volatility per ticker and keeps only the top 20% most volatile names (plus mandatory benchmarks like SPY/QQQ/IWM/EFA).
-3. **State discretization.** Daily returns on the training set (first 70%) are z-scored and bucketed into five states: `Very Down`, `Down`, `Neutral`, `Up`, `Very Up` (thresholds at z = ±0.55 and ±1.15).
-4. **Transition matrix.** A 5×5 transition matrix is built from the training data with Laplace smoothing (α = 0.7).
-5. **Edge filter.** Only tickers whose Markov signal beats random by ≥55% hit rate on training data (with a 20% probability edge threshold) are kept.
-6. **Signal generation.** On the test set, each day's state implies a Long or Short signal when `P(Up)+P(Very Up) − P(Down)+P(Very Down)` exceeds the threshold.
-7. **Position sizing.** Kelly-style weights capped at 20%, distributed across up to 3 trades per day, sized within a daily budget of 55% of equity.
-8. **Risk management.** Hard stop at −3% intraday (LONG: Low ≤ 0.97 × today's Open; SHORT: High ≥ 1.03 × today's Open). 20 bps round-trip transaction costs.
-9. **Index rotation fallback.** On days with no signals, the strategy ranks a basket of country/region ETFs (`SPY, QQQ, IWM, EFA, EEM, EWJ, FXI, EWU, EWG, EWQ, EWZ`) by trend slope / volatility ratio and goes long the strongest / short the weakest using inverse-vol weighting (25% of equity, 5-day hold).
-
----
-
-## Setup
+## Installation
 
 ```bash
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
-python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
+git clone <this-repo>
+cd markov-trading-strategy
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
 ## Usage
 
 ```bash
-python strategy.py
+# Full run with default parameters
+python main.py
+
+# Only backtest the top 10% most volatile tickers (faster)
+python main.py --top-frac 0.10
+
+# Exclude the crypto/commodity macro basket
+python main.py --no-global
+
+# Save the equity curve instead of opening a plot window
+python main.py --save-plot equity_curve.png
 ```
 
-The script will:
-- Fetch tickers from each index
-- Download 20 years of daily price history via `yfinance`
-- Build per-ticker Markov matrices and filter for edge
-- Run the daily backtest over the test period
-- Print the executed trade log and performance metrics
-- Plot the strategy equity curve vs SPY
+All strategy parameters (edge thresholds, holding period, transaction
+costs, position sizing, stop-loss levels) live in `markov_strategy/config.py`
+as a single `StrategyConfig` dataclass — edit or subclass it rather than
+hunting through the codebase for magic numbers.
 
-## Output Metrics
+## Running tests
 
-- Sharpe ratio (daily and annualized)
-- Annualized return (compounded from daily)
-- CAGR (calendar time)
-- SPY benchmark return and return spread
-- CAPM alpha (linear and compounded annualized) with t-stat and p-value
-- Beta and R² vs SPY
-- Final bankroll
+The unit tests use synthetic price data only — no network access or live
+market data is required:
 
-## Configuration
+```bash
+pytest tests/ -v
+```
 
-Key parameters at the top of the script:
+## Project structure
 
-| Parameter | Default | Description |
-|---|---|---|
-| `THRESHOLD_DIFF` | 0.20 | Minimum probability edge to take a trade |
-| `MIN_HIT_RATE` | 0.55 | Minimum train hit rate to keep a ticker |
-| `HOLD_DAYS` | 5 | Holding period for signal trades |
-| `ROUND_TRIP_COST` | 0.002 | 20 bps round-trip transaction cost |
-| `DAILY_BUDGET_FRAC` | 0.55 | Daily capital deployed on signals |
-| `MAX_TRADES_PER_DAY` | 3 | Cap on simultaneous new positions |
-| `KELLY_CAP` | 0.20 | Maximum Kelly weight per trade |
-| `STOP_LOSS_PCT` | −0.03 | Hard stop loss percentage |
-| `FALLBACK_BUDGET_FRAC` | 0.25 | Capital for index-rotation fallback |
+```
+markov-trading-strategy/
+├── main.py                    # CLI entrypoint
+├── markov_strategy/
+│   ├── config.py               # StrategyConfig — all tunable parameters
+│   ├── data.py                  # ticker universes, price data helpers, caches
+│   ├── markov.py                 # state discretization, transition matrix, signals
+│   ├── rotation.py                # quiet-day index-rotation fallback
+│   ├── universe.py                 # volatility prefiltering
+│   ├── backtest.py                  # daily simulation loop, stops, MTM
+│   └── metrics.py                    # Sharpe/CAPM/plotting
+├── tests/                      # pytest unit tests (synthetic data, no network)
+├── paper/
+│   ├── summary.tex              # LaTeX write-up of methodology
+│   └── summary.pdf              # compiled PDF
+├── requirements.txt
+└── LICENSE
+```
 
-## Disclaimer
+## Known limitations
 
-This is a research/educational backtest. It is not investment advice. Past performance does not guarantee future results. Real-world execution costs, slippage, market impact, and survivorship bias in ticker lists may materially affect live results.
+- **Survivorship bias.** Index constituents are pulled from *current*
+  membership lists (Wikipedia / yfinance) and then backtested over 20 years
+  of history. Companies that were removed from an index (delisted,
+  acquired, bankrupt) are excluded, which biases historical performance
+  upward relative to what a real-time strategy would have achieved.
+- **No slippage/market-impact model beyond a flat round-trip cost.** Real
+  execution costs, especially for less liquid international tickers, will
+  differ from the flat 20 bps assumption.
+- **Stop-loss realism.** Stops book a fixed `STOP_LOSS_PCT` rather than the
+  exact price at which a gap-through would have executed, which
+  understates losses on large overnight gaps.
+- **Data availability across markets.** Hong Kong, Shanghai, London, and
+  Tokyo tickers depend on yfinance's coverage and can have gaps, delisted
+  symbols, or FX-related quirks (all prices are in local currency, i.e. no
+  FX-adjustment is applied across markets).
+- **Runtime.** Downloading and modeling thousands of tickers one at a time
+  via `yfinance` is slow and can hit rate limits; the volatility prefilter
+  is a mitigation, not a fix.
+
+This is a research/educational backtester, not investment advice, and
+historical backtest performance is not indicative of future results.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

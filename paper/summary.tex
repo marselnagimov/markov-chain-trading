@@ -1,0 +1,334 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+
+\title{A Markov-Chain Multi-Market Trading Strategy: \\
+Methodology, Implementation, and Backtest Design}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note documents a discrete-state Markov-chain trading strategy that is
+applied across five global equity index universes (S\&P 500, Hang Seng,
+Shanghai Composite, FTSE 100, Nikkei 225) and a fixed global macro basket
+(crypto, commodities, and leveraged/sector ETFs). Daily returns are
+z-scored and mapped onto a five-state alphabet, a train-only transition
+matrix is estimated per ticker, and tickers are retained only if their
+one-step-ahead directional signal clears a minimum edge and hit-rate
+threshold on the training data. Retained tickers generate Kelly-capped,
+fixed-holding-period trade signals on held-out test data, which are then
+run through a daily event-driven backtest with transaction costs, intraday
+stop losses, and a volatility/trend-based index-rotation fallback for days
+without an active signal. We describe the full pipeline, the risk
+management rules, the performance attribution methodology (Sharpe ratio
+and CAPM alpha/beta against SPY), and discuss the backtest's principal
+limitations, most notably survivorship bias in the ticker universes.
+\end{abstract}
+
+\tableofcontents
+
+% ============================================================
+\section{Motivation}
+% ============================================================
+
+Momentum and mean-reversion effects in daily equity returns are well
+documented empirically, but their sign and strength are regime- and
+asset-dependent. Rather than assume a single global rule (e.g. ``buy after
+two down days''), this project estimates a \emph{per-ticker}, data-driven
+transition structure: each ticker's own history is discretized into a small
+state alphabet describing the size of its daily move, and a transition
+matrix over that alphabet is fit on a training sample. If the fitted matrix
+implies a strong enough directional edge out-of-sample, the ticker is
+included in the tradable universe; if not, it is discarded. This turns
+"does momentum/mean-reversion exist here" into an explicit, per-ticker
+statistical test with a pre-registered threshold, rather than a strategy
+applied uniformly to every instrument.
+
+% ============================================================
+\section{State Space and Transition Matrix Estimation}
+% ============================================================
+
+\subsection{Return discretization}
+
+For a given ticker, let $r_t$ denote the daily percentage return computed
+from adjusted close prices. The full return history is split
+chronologically into a training segment (the first 70\% of observations)
+and a held-out test segment (the remaining 30\%):
+\[
+  r_1, \dots, r_T \;=\; \underbrace{r_1, \dots, r_{\lfloor 0.7T \rfloor}}_{\text{train}}
+  \;\cup\; \underbrace{r_{\lfloor 0.7T \rfloor + 1}, \dots, r_T}_{\text{test}}.
+\]
+
+The training-set mean $\mu$ and (population) standard deviation $\sigma$
+are computed \emph{only} from the training segment, and used to z-score
+\emph{both} segments:
+\[
+  z_t = \frac{r_t - \mu}{\sigma}, \qquad t = 1, \dots, T.
+\]
+
+Using train-only statistics to standardize the test segment avoids
+look-ahead bias: nothing about the test-period distribution of returns
+influences the discretization boundaries.
+
+Each $z_t$ is then mapped to one of five states using two boundary
+parameters, $\delta = 0.55$ (the ``moderate move'' boundary) and
+$\varepsilon = 1.15$ (the ``extreme move'' boundary):
+
+\[
+  s_t =
+  \begin{cases}
+    \text{Very Down} & z_t \le -\varepsilon \\
+    \text{Down}      & -\varepsilon < z_t \le -\delta \\
+    \text{Neutral}   & -\delta < z_t < \delta \\
+    \text{Up}        & \delta \le z_t < \varepsilon \\
+    \text{Very Up}   & z_t \ge \varepsilon
+  \end{cases}
+\]
+
+\subsection{Transition matrix estimation with Laplace smoothing}
+
+Let $\mathcal{S} = \{\text{Very Down}, \text{Down}, \text{Neutral},
+\text{Up}, \text{Very Up}\}$. From the training-set state sequence
+$s_1, \dots, s_n$, raw transition counts are accumulated:
+\[
+  N_{ij} = \sum_{t=1}^{n-1} \mathbf{1}\{s_t = i,\, s_{t+1} = j\}, \qquad i, j \in \mathcal{S}.
+\]
+
+To avoid zero-probability transitions for state pairs that are rare or
+absent in the training window, Laplace (additive) smoothing with constant
+$\alpha = 0.7$ is applied before row-normalizing:
+\[
+  \hat{P}(j \mid i) = \frac{N_{ij} + \alpha}{\sum_{k \in \mathcal{S}} (N_{ik} + \alpha)}.
+\]
+
+This yields a $5 \times 5$ row-stochastic transition matrix $\hat{P}$,
+estimated entirely from the training segment.
+
+% ============================================================
+\section{Edge Filtering}
+% ============================================================
+
+Not every ticker's transition matrix implies a usable trading edge. For
+each state $i$, define the \emph{net directional probability}
+\[
+  \Delta(i) = \big[\hat P(\text{Up}\mid i) + \hat P(\text{Very Up}\mid i)\big]
+            - \big[\hat P(\text{Down}\mid i) + \hat P(\text{Very Down}\mid i)\big].
+\]
+
+A ticker is tested for edge by walking the training-set state sequence: at
+each step $t$ where $|\Delta(s_t)| \ge \tau$ (edge threshold, $\tau = 0.2$),
+a directional prediction is made,
+$\text{sign}(\Delta(s_t)) \in \{+1, -1\}$, and scored against the
+\emph{realized} next-day return $r_{t+1}$ as a hit if
+$\text{sign}(\Delta(s_t)) \cdot r_{t+1} > 0$.
+
+Let $H$ be the number of such qualifying predictions and $h$ the number of
+hits. The ticker clears the edge filter only if:
+\begin{itemize}[nosep]
+  \item $H \ge 50$ (minimum sample-size guard against spurious small-sample edges), and
+  \item $h / H \ge 0.55$ (minimum hit rate).
+\end{itemize}
+
+Tickers that fail either condition are dropped from the tradable universe
+entirely — no signals are generated from them on the test set. This is an
+in-sample (training-set) filter; whether the edge \emph{persists}
+out-of-sample is exactly what the test-set backtest evaluates.
+
+% ============================================================
+\section{Signal Generation and Position Sizing}
+% ============================================================
+
+For each ticker that clears the edge filter, its transition matrix
+$\hat P$ is applied to the \textbf{held-out test-set} state sequence to
+generate trade signals. At test-set time $t$ with state $s_t$:
+\[
+  \Delta_{\text{long}} = \max(\Delta(s_t), 0), \qquad
+  \Delta_{\text{short}} = \max(-\Delta(s_t), 0).
+\]
+
+A signal fires only if $\max(\Delta_{\text{long}}, \Delta_{\text{short}})
+\ge \tau$. The trade direction is Long if $\Delta_{\text{long}} \ge
+\Delta_{\text{short}}$, else Short. The position's raw Kelly-style weight
+is
+\[
+  \kappa = \min\big(\max(\Delta_{\text{long}}, \Delta_{\text{short}}),\; \kappa_{\max}\big),
+  \qquad \kappa_{\max} = 0.20,
+\]
+i.e. the magnitude of the directional edge itself is used as a
+(capped) sizing signal — larger edges get proportionally larger size, up to
+a 20\% cap. Each signal has a fixed holding period of $H_d = 5$ trading
+days: the position is entered at the test-set date's close and scheduled to
+exit five trading days later.
+
+\subsection{Daily capital allocation}
+
+On any trading day $d$ with one or more fresh signals, a fixed fraction of
+the day's starting equity is put at risk:
+\[
+  C_d = \phi \cdot E_d, \qquad \phi = 0.55,
+\]
+where $E_d$ is equity (cash plus mark-to-market of open positions) at the
+start of day $d$. At most $M = 3$ signals are taken per day, chosen by
+descending $\kappa$, and each is allocated a share of $C_d$ proportional to
+its own $\kappa$ relative to the sum of $\kappa$ across the day's taken
+signals.
+
+% ============================================================
+\section{Risk Management}
+% ============================================================
+
+\subsection{Intraday stop losses}
+
+Every open position (other than on its entry day) is checked daily against
+an intraday stop, referenced to the position's \emph{entry-day opening
+price} $O_0$ (not the entry fill price):
+\[
+  \text{Long stop: } L_d \le 0.97 \cdot O_0,
+  \qquad
+  \text{Short stop: } H_d \ge 1.03 \cdot O_0,
+\]
+where $L_d, H_d$ are the day's low and high. If triggered, the position is
+closed at a fixed booked loss of $\text{STOP\_LOSS\_PCT} = -3\%$ of its
+notional size (rather than the exact intraday execution price), net of a
+half round-trip transaction cost.
+
+\subsection{Transaction costs}
+
+A flat round-trip cost of 20 basis points ($\text{ROUND\_TRIP\_COST} =
+0.002$) is charged on both entry and exit, applied as half the round-trip
+cost against notional size at each leg.
+
+\subsection{Quiet-day index rotation fallback}
+
+On days with no qualifying Markov signal, the strategy does not sit
+entirely idle. Instead, it ranks a fixed basket of eleven broad index ETFs
+(SPY, QQQ, IWM, EFA, EEM, EWJ, FXI, EWU, EWG, EWQ, EWZ) by a
+volatility-adjusted trend score:
+\[
+  \text{score}(i) = \frac{\hat\beta_i \cdot 252}{\hat\sigma_i},
+\]
+where $\hat\beta_i$ is the slope of a linear fit to $\log$-price over the
+trailing 60 trading days, and $\hat\sigma_i$ is the trailing 20-day
+realized volatility, annualized. The strategy goes long the
+highest-scoring ETF and short the lowest-scoring ETF, sized inversely to
+their respective volatilities and capped at 25\% of equity in aggregate
+($\text{FALLBACK\_BUDGET\_FRAC}$), held for 5 trading days.
+
+% ============================================================
+\section{Backtest Engine}
+% ============================================================
+
+The simulation is a daily event loop over the full business-day range
+implied by the generated signals. Algorithm~\ref{alg:loop} summarizes the
+per-day sequence of operations.
+
+\begin{algorithm}[h]
+\caption{Daily backtest loop}
+\label{alg:loop}
+\begin{algorithmic}[1]
+\For{each business day $d$}
+  \State Mark all open positions to market; compute $E_d$ = cash + MTM
+  \If{signals exist for $d$}
+    \State Open Markov-signal trades, sized per Section 4.1
+  \Else
+    \State Open index-rotation fallback trades (Section 5.3)
+  \EndIf
+  \State Apply intraday stop losses to all positions opened on prior days
+  \State Close any position whose scheduled exit day has arrived
+  \State Record end-of-day equity and daily P\&L
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+Price data is cached in two forms prior to simulation: an
+adjusted-close series (for mark-to-market and exit pricing) and a
+\emph{non-adjusted} OHLC series (needed so that intraday stop checks
+reference true traded highs/lows rather than dividend/split-adjusted
+values).
+
+% ============================================================
+\section{Performance Attribution}
+% ============================================================
+
+Let $\{E_d\}$ be the realized daily equity curve and $\{\rho_d\}$ the
+corresponding simple daily returns. With an assumed annual risk-free rate
+of $5\%$ ($\rho_f = (1.05)^{1/252} - 1$ daily), the excess return series is
+$\rho_d^{\text{ex}} = \rho_d - \rho_f$.
+
+\paragraph{Sharpe ratio.}
+\[
+  \text{Sharpe}_{\text{daily}} = \frac{\overline{\rho^{\text{ex}}}}{\text{sd}(\rho^{\text{ex}})},
+  \qquad
+  \text{Sharpe}_{\text{annual}} = \sqrt{252}\cdot \text{Sharpe}_{\text{daily}}.
+\]
+
+\paragraph{Annualized return.} Both a compounding-based estimate and a
+calendar-time CAGR are reported:
+\[
+  r_{\text{ann}} = \Big(\prod_d (1+\rho_d)\Big)^{252/n} - 1,
+  \qquad
+  \text{CAGR} = \Big(\frac{E_{\text{final}}}{E_{\text{initial}}}\Big)^{365.25/\text{days}} - 1.
+\]
+
+\paragraph{CAPM alpha and beta.} The strategy's excess returns are
+regressed on SPY's excess returns over the same aligned dates:
+\[
+  \rho_d^{\text{ex}} = \alpha + \beta \cdot \rho_{d,\text{SPY}}^{\text{ex}} + \epsilon_d,
+\]
+estimated by OLS. Both a linearly annualized alpha ($252\alpha$) and a
+compounded annualized alpha ($(1+\alpha)^{252}-1$) are reported, along with
+$\beta$, $R^2$, and the $t$-statistic/$p$-value on $\alpha$ for a rough
+read on statistical significance of any outperformance.
+
+% ============================================================
+\section{Discussion and Limitations}
+% ============================================================
+
+\begin{itemize}
+  \item \textbf{Survivorship bias.} Index constituents (S\&P 500, FTSE 100,
+  Hang Seng, Nikkei 225) are pulled from \emph{current} membership lists
+  and then backtested over 20 years of price history. Firms removed from
+  an index over that period (delisted, acquired, bankrupt) are excluded
+  from the universe, which mechanically biases the backtest's historical
+  performance upward relative to a strategy that could only have known
+  index membership in real time.
+  \item \textbf{In-sample edge filter, out-of-sample evaluation.} The edge
+  filter (Section 3) is applied to the training segment; the actual P\&L
+  is generated only from test-segment signals. This mitigates but does not
+  eliminate selection effects from testing many tickers simultaneously
+  (multiple-comparisons risk): with a large universe, some tickers will
+  clear a 55\% training-set hit-rate threshold by chance alone.
+  \item \textbf{Approximated stop-loss execution.} A triggered stop books a
+  fixed $-3\%$ loss on notional rather than the exact price at which a
+  gap-through would have executed, which understates losses in the tails
+  (large overnight gaps).
+  \item \textbf{No cross-market FX adjustment.} Hang Seng, Shanghai, FTSE,
+  and Nikkei tickers are priced and P\&L'd in local currency; no
+  currency-hedging or FX-translation is modeled, so realized USD returns
+  for a US-based investor would differ from what is reported.
+  \item \textbf{Data coverage and runtime.} Data availability and quality
+  via \texttt{yfinance} varies substantially across exchanges; the
+  volatility-based prefilter (retaining only the top 20\% most volatile
+  tickers) is a practical runtime mitigation, not a methodological
+  requirement of the strategy.
+\end{itemize}
+
+This document accompanies the code in the project repository
+(\texttt{markov\_strategy/}) and is intended as a methodology reference,
+not as investment advice. Past backtest performance is not indicative of
+future results.
+
+\end{document}

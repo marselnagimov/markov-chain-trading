@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""
+main.py
+-------
+CLI entrypoint for the Markov-chain trading strategy backtest.
+
+Usage:
+    python main.py                      # full run with default config
+    python main.py --top-frac 0.10      # only backtest top 10% most volatile
+    python main.py --no-global          # exclude crypto/commodity ETFs
+    python main.py --save-plot out.png  # save equity curve instead of showing it
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import warnings
+
+import pandas as pd
+
+from markov_strategy.config import DEFAULT_CONFIG, INDEX_BASKET
+from markov_strategy.data import build_ticker_universe, build_close_cache
+from markov_strategy.universe import flatten_universe, filter_by_volatility
+from markov_strategy.markov import build_markov_matrix, has_edge, analyze_trade_signals
+from markov_strategy.backtest import run_backtest, set_ohlc_cache
+from markov_strategy.metrics import compute_performance, print_report, plot_equity_curve
+from markov_strategy import data as data_mod
+
+warnings.simplefilter(action="ignore", category=FutureWarning)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Markov-chain trading strategy backtest")
+    p.add_argument("--top-frac", type=float, default=0.20,
+                   help="fraction of most-volatile tickers to keep (default 0.20)")
+    p.add_argument("--no-global", action="store_true",
+                   help="exclude the crypto/commodity 'Global' macro basket")
+    p.add_argument("--save-plot", type=str, default=None,
+                   help="path to save the equity-curve plot instead of showing it")
+    p.add_argument("--quiet", action="store_true", help="suppress per-ticker progress output")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    cfg = DEFAULT_CONFIG
+    verbose = not args.quiet
+
+    print("Retrieving tickers...\n")
+    ticker_universe = build_ticker_universe(include_global=not args.no_global)
+    all_tickers = flatten_universe(ticker_universe)
+    if verbose:
+        for t in all_tickers:
+            print(t)
+
+    volatile_tickers = filter_by_volatility(all_tickers, top_frac=args.top_frac, verbose=verbose)
+
+    # ---------- Signals with edge filter ----------
+    all_signals = []
+    for ticker in volatile_tickers:
+        tm, train_df, test_df = build_markov_matrix(
+            ticker, alpha=cfg.alpha_smooth
+        )
+        if tm is None or train_df is None or test_df is None:
+            continue
+        if not has_edge(train_df, tm, min_diff=cfg.threshold_diff, min_hit=cfg.min_hit_rate):
+            continue
+        sigs = analyze_trade_signals(
+            ticker, test_df, tm,
+            min_diff=cfg.threshold_diff, hold_days=cfg.hold_days, kelly_cap=cfg.kelly_cap,
+        )
+        all_signals.extend(sigs)
+
+    if not all_signals:
+        print("No signals generated. Exiting.")
+        sys.exit(0)
+
+    signal_df = pd.DataFrame(all_signals, columns=["Date", "Ticker", "Position", "EntryPrice", "ExitPrice", "Kelly"])
+    signal_df["Date"] = pd.to_datetime(signal_df["Date"]).dt.normalize()
+    signal_df = signal_df.sort_values("Date")
+
+    # ---------- Simulation setup ----------
+    first_day = signal_df["Date"].min()
+    last_day = signal_df["Date"].max() + pd.Timedelta(days=cfg.hold_days)
+    bdays = pd.bdate_range(first_day, last_day)
+
+    tickers = sorted(set(signal_df["Ticker"].unique()).union(INDEX_BASKET))
+    close_px = build_close_cache(tickers, first_day, last_day, bdays)
+    set_ohlc_cache(data_mod.build_ohlc_cache(tickers, first_day, last_day, bdays))
+
+    # ---------- Run backtest ----------
+    trade_log_df, daily_df = run_backtest(signal_df, INDEX_BASKET, close_px, cfg)
+
+    if not trade_log_df.empty:
+        print("\n--- Executed Trades ---")
+        print(trade_log_df[["Ticker", "Position", "Action", "Size", "PnL", "Cash"]].fillna(""))
+
+    # ---------- Reporting ----------
+    metrics = compute_performance(daily_df, starting_capital=cfg.starting_capital)
+    print_report(metrics)
+    plot_equity_curve(metrics, starting_capital=cfg.starting_capital, save_path=args.save_plot)
+
+
+if __name__ == "__main__":
+    main()
